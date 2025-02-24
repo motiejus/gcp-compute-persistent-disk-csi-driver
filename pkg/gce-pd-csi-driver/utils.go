@@ -311,6 +311,15 @@ func collectMountOptions(fsType string, mntFlags []string) []string {
 			// passed directly as an option to the mount command.
 			continue
 		}
+
+		// btrfs flags are chrono-special. See go/btrfs-reclaim
+		if btrfsReclaimDataRegex.FindString(opt) != "" {
+			continue
+		}
+		if btrfsReclaimMetadataRegex.FindString(opt) != "" {
+			continue
+		}
+
 		options = append(options, opt)
 	}
 

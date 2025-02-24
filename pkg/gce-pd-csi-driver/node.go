@@ -15,10 +15,12 @@ limitations under the License.
 package gceGCEDriver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -102,10 +104,14 @@ const (
 	fsTypeExt3                 = "ext3"
 
 	readAheadKBMountFlagRegexPattern = "^read_ahead_kb=(.+)$"
+	btrfsReclaimDataRegexPattern     = "^btrfs_reclaim_data=(\\d{1,2})$"     // 0-99 are valid, incl. 00
+	btrfsReclaimMetadataRegexPattern = "^btrfs_reclaim_metadata=(\\d{1,2})$" // ditto ^
 )
 
 var (
 	readAheadKBMountFlagRegex = regexp.MustCompile(readAheadKBMountFlagRegexPattern)
+	btrfsReclaimDataRegex     = regexp.MustCompile(btrfsReclaimDataRegexPattern)
+	btrfsReclaimMetadataRegex = regexp.MustCompile(btrfsReclaimMetadataRegexPattern)
 )
 
 func getDefaultFsType() string {
@@ -374,6 +380,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	// Part 3: Mount device to stagingTargetPath
 	fstype := getDefaultFsType()
 
+	var btrfsReclaimData, btrfsReclaimMetadata string
 	shouldUpdateReadAhead := false
 	var readAheadKB int64
 	options := []string{}
@@ -387,6 +394,8 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "failure parsing mount flags: %v", err.Error())
 		}
+
+		btrfsReclaimData, btrfsReclaimMetadata = extractBtrfsReclaimFlags(mnt.MountFlags)
 	} else if blk := volumeCapability.GetBlock(); blk != nil {
 		// Noop for Block NodeStageVolume
 		klog.V(4).Infof("NodeStageVolume succeeded on %v to %s, capability is block so this is a no-op", volumeID, stagingTargetPath)
@@ -438,8 +447,59 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		}
 	}
 
+	// Part 6: if configured, write sysfs values
+	if !readonly {
+		var sysfs map[string]string
+		if btrfsReclaimData != "" {
+			sysfs["allocation/data/bg_reclaim_threshold"] = btrfsReclaimData
+		}
+		if btrfsReclaimMetadata != "" {
+			sysfs["allocation/metadata/bg_reclaim_threshold"] = btrfsReclaimMetadata
+		}
+
+		if len(sysfs) > 0 {
+			args := []string{"--match-tag", "UUID", "--output", "value", stagingTargetPath}
+			cmd := exec.Command("blkid", args...)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			klog.V(4).Infof("running %q for volume %s", cmd.String(), volumeID)
+			uuid, err := cmd.Output()
+			if err != nil {
+				klog.Errorf("lsblk failed for %s. stderr:\n%s", volumeID, stderr.String())
+				return nil, status.Errorf(codes.Internal, "blkid failed: %v", err)
+			}
+
+			uuid = bytes.TrimRight(uuid, "\n")
+
+			for key, value := range sysfs {
+				path := fmt.Sprintf("/sys/fs/btrfs/%s/%s", uuid, key)
+				if err := writeSysfs(path, value); err != nil {
+					return nil, status.Error(codes.Internal, fmt.Sprintf("set %s=%s: %v", path, value, err))
+				}
+				klog.V(4).Infof("NodeStageVolume set %s %s=%s", volumeID, key, value)
+			}
+		}
+	}
+
 	klog.V(4).Infof("NodeStageVolume succeeded on %v to %s", volumeID, stagingTargetPath)
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+func writeSysfs(path, value string) (_err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		_err = errors.Join(_err, f.Close())
+	}()
+
+	if _, err := f.Write([]byte(value)); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (ns *GCENodeServer) updateReadAhead(devicePath string, readAheadKB int64) error {
@@ -456,6 +516,18 @@ func (ns *GCENodeServer) updateReadAhead(devicePath string, readAheadKB int64) e
 	}
 
 	return nil
+}
+
+func extractBtrfsReclaimFlags(mountFlags []string) (string, string) {
+	var reclaimData, reclaimMetadata string
+	for _, mountFlag := range mountFlags {
+		if got := btrfsReclaimDataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			reclaimData = got[1]
+		} else if got := btrfsReclaimMetadataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			reclaimMetadata = got[1]
+		}
+	}
+	return reclaimData, reclaimMetadata
 }
 
 func extractReadAheadKBMountFlag(mountFlags []string) (int64, bool, error) {
